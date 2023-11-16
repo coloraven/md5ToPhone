@@ -3,7 +3,12 @@
 ## 优势
 可多核心同时处理
 ## 用法
-`main.go -hashfile=c:\dds.txt -pre=pre.txt -memory=false`
+### 携参运行
+可指定输入文件
+```
+main.go -hashfile=c:\dds.txt -pre=pre.txt -memory=false
+```
+### 直接运行
 如果不带参数运行，则默认读取hashes.txt和pre.txt（两个文本都为一行一条记录），并使用内存模式运行。
 
 

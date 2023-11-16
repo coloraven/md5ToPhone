@@ -20,6 +20,7 @@ import (
 var mu sync.Mutex
 var totalHashes int32
 var matched int32
+var memoryMode bool
 
 // 定义一个用于存储数据的结构体
 type PhoneHash struct {
@@ -27,6 +28,8 @@ type PhoneHash struct {
 	Phone string
 	Hash  string
 }
+
+var phoneHashesInMemory []PhoneHash // 在内存模式下使用的切片
 
 // 初始化数据库连接
 func InitDB() (*gorm.DB, error) {
@@ -55,12 +58,14 @@ func InitDB() (*gorm.DB, error) {
 
 func main() {
 	start := time.Now()
+
 	// 定义命令行参数
+	memoryFlag := flag.Bool("memory", true, "Use memory mode to store data instead of SQLite database")
 	hashFilePath := flag.String("hashfile", "hashes.txt", "Path to the file containing MD5 hashes")
-	prefixFilePath := flag.String("pre", "prefixes.txt", "Path to the file containing phone number prefixes")
-
+	prefixFilePath := flag.String("pre", "pre.txt", "Path to the file containing phone number prefixes")
 	flag.Parse() // 解析命令行参数
-
+	fmt.Println("\n默认为内存模式，如果需要翻译的md5值数据量过大，请使用 -memory=false 关闭内存模式，将会使用sqlite3储存中间数据。\n")
+	memoryMode = *memoryFlag
 	// 读取哈希文件内容
 	hashes, err := loadHashes(*hashFilePath)
 	if err != nil {
@@ -70,16 +75,7 @@ func main() {
 	totalHashes = int32(len(hashes))
 
 	// 启动一个协程定期打印进度
-	go func() {
-		for {
-			time.Sleep(1 * time.Second) // 每秒更新一次
-			currentMatched := atomic.LoadInt32(&matched)
-			fmt.Printf("\rMatched: %d/%d", currentMatched, totalHashes)
-			if currentMatched >= totalHashes {
-				break
-			}
-		}
-	}()
+	go startProgress()
 
 	// 读取手机号前缀文件
 	prefixes, err := loadPrefixes(*prefixFilePath)
@@ -88,61 +84,13 @@ func main() {
 		return
 	}
 
-	db, err := InitDB()
-	if err != nil {
-		fmt.Println("Error initializing database:", err)
-		return
-	}
-
-	var wg sync.WaitGroup
-
-	for _, prefix := range prefixes {
-		wg.Add(1)
-		go func(prefix string) {
-			defer wg.Done()
-			for i := 0; i < 100000000; i++ {
-				phone := fmt.Sprintf("%s%08d", prefix, i)
-				hash := md5Hash(phone)
-				mu.Lock() // 在访问共享资源前加锁
-				if _, found := hashes[hash]; found {
-					delete(hashes, hash)
-					insertPhoneHash(db, phone, hash)
-					// fmt.Println(hash, phone)
-				}
-				if len(hashes) == 0 {
-					mu.Unlock() // 解锁后直接返回
-					return
-				}
-				mu.Unlock() // 操作完成后解锁
-			}
-		}(prefix)
-	}
-
-	wg.Wait()
-	// 导出到 CSV 文件
-	if err := exportToCSV(db, "output.csv"); err != nil {
-		fmt.Println("Error exporting to CSV:", err)
-		return
-	}
-
-	// 关闭数据库连接
-	sqlDB, err := db.DB()
-	if err != nil {
-		fmt.Println("Error closing database:", err)
-		return
-	}
-	sqlDB.Close()
-
-	// 删除数据库文件
-	if err := os.Remove("phone_hashes.db"); err != nil {
-		fmt.Println("Error deleting database file:", err)
-	}
-	// 将未匹配的哈希写入文件
-	if err := writeUnmatchedHashes(hashes, "unmatched.txt"); err != nil {
-		fmt.Println("Error writing unmatched hashes:", err)
+	if memoryMode {
+		runInMemoryMode(hashes, prefixes)
+	} else {
+		runInDBMode(hashes, prefixes)
 	}
 	duration := time.Since(start)
-	fmt.Printf("Program finished in %s\n", duration)
+	fmt.Printf("\nProgram finished in %s\n", duration)
 }
 
 func md5Hash(text string) string {
@@ -152,7 +100,6 @@ func md5Hash(text string) string {
 
 func insertPhoneHash(db *gorm.DB, phone, hash string) {
 	db.Create(&PhoneHash{Phone: phone, Hash: hash})
-	atomic.AddInt32(&matched, 1) // 更新匹配计数
 }
 
 func loadHashes(filename string) (map[string]struct{}, error) {
@@ -236,4 +183,113 @@ func writeUnmatchedHashes(hashes map[string]struct{}, filePath string) error {
 	}
 
 	return nil
+}
+
+// 将内存数据写入到文本文件
+func writeToTextFile(data []PhoneHash, filePath string) error {
+	file, err := os.Create(filePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	for _, ph := range data {
+		if _, err := file.WriteString(fmt.Sprintf("%s,%s\n", ph.Phone, ph.Hash)); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func runInMemoryMode(hashes map[string]struct{}, prefixes []string) {
+	var wg sync.WaitGroup
+	for _, prefix := range prefixes {
+		wg.Add(1)
+		go func(prefix string) {
+			defer wg.Done()
+			for i := 0; i < 100000000; i++ {
+				phone := fmt.Sprintf("%s%08d", prefix, i)
+				hash := md5Hash(phone)
+				mu.Lock()
+				if _, found := hashes[hash]; found {
+					phoneHashesInMemory = append(phoneHashesInMemory, PhoneHash{Phone: phone, Hash: hash})
+					atomic.AddInt32(&matched, 1)
+					delete(hashes, hash)
+				}
+				mu.Unlock()
+			}
+		}(prefix)
+	}
+	wg.Wait()
+
+	// ... 将内存中的数据写入文件 ...
+	if err := writeToTextFile(phoneHashesInMemory, "output.txt"); err != nil {
+		fmt.Println("Error writing to text file:", err)
+	}
+	// ... 将未匹配的哈希写入文件 ...
+	if err := writeUnmatchedHashes(hashes, "unmatched.txt"); err != nil {
+		fmt.Println("Error writing unmatched hashes:", err)
+	}
+}
+
+func runInDBMode(hashes map[string]struct{}, prefixes []string) {
+	db, err := InitDB()
+	if err != nil {
+		fmt.Println("Error initializing database:", err)
+		return
+	}
+
+	var wg sync.WaitGroup
+	for _, prefix := range prefixes {
+		wg.Add(1)
+		go func(prefix string) {
+			defer wg.Done()
+			for i := 0; i < 100000000; i++ {
+				phone := fmt.Sprintf("%s%08d", prefix, i)
+				hash := md5Hash(phone)
+				mu.Lock()
+				if _, found := hashes[hash]; found {
+					insertPhoneHash(db, phone, hash)
+					atomic.AddInt32(&matched, 1)
+					delete(hashes, hash)
+				}
+				mu.Unlock()
+			}
+		}(prefix)
+	}
+	wg.Wait()
+
+	// 导出到 CSV 文件
+	if err := exportToCSV(db, "output.csv"); err != nil {
+		fmt.Println("Error exporting to CSV:", err)
+		return
+	}
+	// 关闭数据库连接
+	sqlDB, err := db.DB()
+	if err != nil {
+		fmt.Println("Error closing database:", err)
+		return
+	}
+	sqlDB.Close()
+
+	// 删除数据库文件
+	if err := os.Remove("phone_hashes.db"); err != nil {
+		fmt.Println("Error deleting database file:", err)
+	}
+	// ... 将未匹配的哈希写入文件 ...
+	if err := writeUnmatchedHashes(hashes, "unmatched.txt"); err != nil {
+		fmt.Println("Error writing unmatched hashes:", err)
+	}
+}
+
+func startProgress() {
+	for {
+		time.Sleep(1 * time.Second) // 每秒更新一次
+		currentMatched := atomic.LoadInt32(&matched)
+		fmt.Printf("\r已翻译: %d/%d", currentMatched, totalHashes)
+		if currentMatched >= totalHashes {
+			break
+		}
+	}
 }

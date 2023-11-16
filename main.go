@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gorm.io/driver/sqlite"
@@ -17,6 +18,8 @@ import (
 )
 
 var mu sync.Mutex
+var totalHashes int32
+var matched int32
 
 // 定义一个用于存储数据的结构体
 type PhoneHash struct {
@@ -64,6 +67,19 @@ func main() {
 		fmt.Println("Error loading hashes:", err)
 		return
 	}
+	totalHashes = int32(len(hashes))
+
+	// 启动一个协程定期打印进度
+	go func() {
+		for {
+			time.Sleep(1 * time.Second) // 每秒更新一次
+			currentMatched := atomic.LoadInt32(&matched)
+			fmt.Printf("\rMatched: %d/%d", currentMatched, totalHashes)
+			if currentMatched >= totalHashes {
+				break
+			}
+		}
+	}()
 
 	// 读取手机号前缀文件
 	prefixes, err := loadPrefixes(*prefixFilePath)
@@ -91,7 +107,7 @@ func main() {
 				if _, found := hashes[hash]; found {
 					delete(hashes, hash)
 					insertPhoneHash(db, phone, hash)
-					fmt.Println(hash, phone)
+					// fmt.Println(hash, phone)
 				}
 				if len(hashes) == 0 {
 					mu.Unlock() // 解锁后直接返回
@@ -136,6 +152,7 @@ func md5Hash(text string) string {
 
 func insertPhoneHash(db *gorm.DB, phone, hash string) {
 	db.Create(&PhoneHash{Phone: phone, Hash: hash})
+	atomic.AddInt32(&matched, 1) // 更新匹配计数
 }
 
 func loadHashes(filename string) (map[string]struct{}, error) {
